@@ -1,0 +1,11 @@
+{application, glicko2,
+ [
+  {description, "Glicko 2 Ranking code"},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {env, []}
+ ]}.
