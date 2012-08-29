@@ -1,11 +1,26 @@
 -module(glicko2).
 
--export([phi_star/2,
-         glicko_test/0,
-         rate/4]).
+-export([configuration/3,
+         read_config/1]).
 
--define(TAU, 0.5). % Good values are between 0.3 and 1.2
+-export([phi_star/2,
+         rate/4, rate/5]).
+
+-ifdef(TEST).
+-export([glicko_volatility_test/0]).
+-export([glicko_test/0]).
+-endif.
+
 -define(EPSILON, 0.000001).
+-record(config, { rd, v, tau}).
+
+configuration(IRD, IV, Tau) ->
+    #config { rd = IRD,
+              v  = IV,
+              tau = Tau }.
+
+read_config(#config { rd = RD, v = Sigma, tau = Tau}) ->
+    {RD, Sigma, Tau}.
 
 square(V) -> V*V.
 
@@ -41,53 +56,71 @@ compute_delta(V, Opponents) ->
                    || {_Muj, _Phij, GPhij, EMMP, Sj} <- Opponents]).
 
 %% Step 5
-vol_f(Phi, V, Delta, A) ->
+vol_f(Phi, V, Delta, A, #config { tau = Tau }) ->
     PHI2 = Phi*Phi,
     fun(X) ->
             EX = math:exp(X),
             D2 = Delta*Delta,
             A2 = (PHI2 + V + EX),
-            P2 = (X - A) / (?TAU * ?TAU),
+            P2 = (X - A) / (Tau * Tau),
             P1 = (EX * (D2 - PHI2 - V - EX))  / (2*A2*A2),
             P1 - P2
     end.
 
-vol_k(K, F, A) ->
-    Const = A - K*math:sqrt(?TAU*?TAU),
+vol_k(K, F, A, #config { tau = Tau} = Conf) ->
+    Const = A - K*math:sqrt(Tau*Tau),
     case F(Const) < 0 of
         true ->
-            vol_k(K+1, F, A);
+            vol_k(K+1, F, A, Conf);
         false ->
             Const
     end.
 
-compute_volatility(Sigma, Phi, V, Delta) ->
+i_compute_volatility(Sigma, Phi, V, Delta, #config { tau = Tau } = Conf) ->
     A = math:log(Sigma*Sigma),
-    F = vol_f(Phi, V, Delta, A),
+    F = vol_f(Phi, V, Delta, A, Conf),
     B = case Delta*Delta > Phi*Phi + V of
             true ->
                 math:log(Delta*Delta - Phi*Phi - V);
             false ->
-                vol_k(1, F, A)
+                vol_k(1, F, A, Conf)
         end,
     FA = F(A),
     FB = F(B),
-    compute_volatility(A, B, F, FA, FB).
+    try
+        compute_volatility(A, B, F, FA, FB, 100)
+    catch
+        throw:{iterations_exceeded, _Vals} ->
+            lager:error("Error in vol comp: ~p", [{Sigma, Phi, V, Delta, Tau}]),
+            exit(bad_vol_comp)
+    end.
 
-compute_volatility(A, B, _F, _FA, _FB) when abs(B - A) < ?EPSILON ->
+sign(X) when X > 0 -> 1;
+sign(X) when X < 0 -> -1;
+sign(0.0)          ->  0.
+
+compute_volatility(A, B, F, FA, FB, 0) ->
+    throw({iterations_exceeded, {A, B, F, FA, FB}});
+compute_volatility(A, B, _F, _FA, _FB, _) when abs(B - A) =< ?EPSILON ->
     math:exp(A/2);
-compute_volatility(A, B, F, FA, FB) ->
-    C = A + (A - B)*FA / (FB - FA),
-    FC = F(C),
-    {NA, NFA} =
-        case FC * FB < 0 of
-            true ->
-                {B, FB};
-            false ->
-                {A, FA / 2}
-        end,
-    compute_volatility(NA, C, F, NFA, FC).
-            
+compute_volatility(A, B, F, FA, FB, K) ->
+    %% C is the midpoint:
+    C = (A + B) * 0.5, FC = F(C),
+    D = C + (C - A) * (sign(FA - FB) * FC) / math:sqrt(FC*FC - FA*FB),
+    FD = F(D),
+    case sign(FD) /= sign(FC) of
+        true ->
+            compute_volatility(C, D, F, FC, FD, K-1);
+        false ->
+            case sign(FD) /= sign(FA) of
+                true ->
+                    compute_volatility(A, D, F, FA, FD, K-1);
+                false ->
+                    true = sign(FD) /= sign(FB),
+                    compute_volatility(D, B, F, FD, FB, K-1)
+            end
+    end.
+
 %% Step 6
 phi_star(SigmaP, Phi) ->
     math:sqrt(square(Phi) + square(SigmaP)).
@@ -109,15 +142,21 @@ unscale(MuP, PhiP) ->
     {RP, RDP}.
 
 rate(R, RD, Sigma, Opponents) ->
+    rate(R, RD, Sigma, Opponents, configuration(350, 0.06, 0.5)).
+
+rate(R, RD, Sigma, Opponents, Conf) ->
     {Mu, Phi} = scale(R, RD),
     ScaledOpponents = scale_opponents(Mu, Opponents),
     V = update_rating(ScaledOpponents),
     Delta = compute_delta(V, ScaledOpponents),
-    SigmaP = compute_volatility(Sigma, Phi, V, Delta),
+    SigmaP = i_compute_volatility(Sigma, Phi, V, Delta, Conf),
     PhiStar = phi_star(SigmaP, Phi),
     {MuP, PhiP} = new_rating(PhiStar, Mu, V, ScaledOpponents),
     {R1, RD1} = unscale(MuP, PhiP),
     {R1, RD1, SigmaP}.
+
+
+-ifdef(TEST).
 
 data() ->
     Player = {a, 1500, 200},
@@ -126,6 +165,8 @@ data() ->
                  {1550, 100, 0},
                  {1700, 300, 0}],
     {Player, Volatility, Opponents}.
+
+within(X, Y) -> abs(X - Y) < 0.0001.
 
 glicko_test() ->
     {{a, R, RD}, Sigma, Opponents} = data(),
@@ -144,12 +185,24 @@ glicko_test() ->
     1.7789770897239976 = V,
     Delta = compute_delta(V, ScaledOpponents),
     -0.4839332609836549 = Delta,
-    SigmaP = compute_volatility(Sigma, Phi, V, Delta),
-    0.059995984286488495 = SigmaP,
+    SigmaP = i_compute_volatility(Sigma, Phi, V, Delta, configuration(350, 0.06, 0.5)),
+    true = within(0.059995984286488495, SigmaP),
     PhiStar = phi_star(SigmaP, Phi),
-    1.1528546895801364 = PhiStar,
+    true = within(1.1528546895801364, PhiStar),
     {MuP, PhiP} = new_rating(PhiStar, Mu, V, ScaledOpponents),
-    {-0.20694096667525494, 0.8721991881307343} = {MuP, PhiP},
+    true = within(-0.20694096667525494, MuP),
+    true = within(0.8721991881307343, PhiP),
     {R1, RD1} = unscale(MuP, PhiP),
-    {1464.0506705393013, 151.51652412385727} = {R1, RD1}.
+    true = within(1464.0506705393013, R1),
+    true = within(151.51652412385727, RD1).
 
+glicko_volatility_test() ->
+    V = 1.7785,
+    Delta = -0.4834,
+    Tau = 0.5,
+    Sigma = 0.06,
+    Phi = 200 / 173.7178,
+    SigmaP = i_compute_volatility(Sigma, Phi, V, Delta, configuration(350, 0.06, Tau)),
+    SigmaP.
+
+-endif.
