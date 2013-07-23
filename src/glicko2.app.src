@@ -3,6 +3,7 @@
   {description, "Glicko 2 Ranking code"},
   {vsn, "1"},
   {registered, []},
+  {modules, []},
   {applications, [
                   kernel,
                   stdlib
